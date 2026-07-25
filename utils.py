@@ -2,7 +2,6 @@
 utils.py -- shared helpers: file sizing, path expansion, formatting
 """
 import os
-import shutil
 import hashlib
 import subprocess
 import time
@@ -44,20 +43,23 @@ def file_size(path: Path) -> int:
             pass
     return total
 
-def safe_remove(path: Path):
+def safe_remove(path: Path) -> tuple[bool, str]:
     """Delete file or dir, best-effort.
     SAFETY: Checks _is_protected() to refuse deleting protected paths.
     Checks is_symlink() before rmtree to prevent following links.
-    For cache/log directories, uses _delete_dir_contents() to preserve the dir."""
+    For cache/log directories, uses _delete_dir_contents() to preserve the dir.
+    Returns (success, message)."""
     # Import here to avoid circular import (scanners imports utils)
     from scanners import _is_protected, _delete_dir_contents
     if _is_protected(path):
-        return
+        return False, f"Refused: {path} is protected"
     try:
         if path.is_symlink():
             path.unlink()
+            return True, f"Removed symlink: {path}"
         elif path.is_file():
             path.unlink()
+            return True, f"Removed file: {path}"
         elif path.is_dir():
             # SAFETY: Never rmtree cache/log directories — preserve the dir itself.
             # These are dirs macOS/apps expect to exist. Delete contents only.
@@ -70,13 +72,27 @@ def safe_remove(path: Path):
             try:
                 resolved = path.resolve()
                 if any(resolved == p.resolve() for p in cache_log_paths):
-                    _delete_dir_contents(path)
-                    return
+                    removed, errors = _delete_dir_contents(path)
+                    if errors:
+                        return True, f"Removed {removed} items (with {len(errors)} errors): {path}"
+                    return True, f"Removed {removed} items: {path}"
             except (OSError, RuntimeError):
                 pass
-            shutil.rmtree(path, ignore_errors=True)
-    except (OSError, PermissionError):
-        pass
+            # SAFETY: Use _delete_dir_contents() + rmdir instead of
+            # shutil.rmtree() to prevent following nested symlinks on
+            # Python <3.12. rmtree would follow a symlink inside the
+            # directory and delete files outside the target.
+            removed, errors = _delete_dir_contents(path)
+            try:
+                path.rmdir()  # remove the now-empty directory shell
+            except OSError:
+                pass
+            if errors:
+                return True, f"Removed {removed} items (with {len(errors)} errors): {path}"
+            return True, f"Removed {removed} items: {path}"
+    except (OSError, PermissionError) as e:
+        return False, f"Failed: {path} — {e}"
+    return False, f"Unknown path type: {path}"
 
 def file_hash(path: Path, algo: str = "sha256", chunk: int = 65536) -> str:
     """Hash a file for duplicate detection."""
@@ -123,14 +139,35 @@ def dir_walk(path: Path, skip_hidden: bool = False):
     """Safe directory walker.
     SAFETY: Skips symlinks to prevent following links outside the target
     directory (e.g. a symlink in ~/Documents pointing to / would cause
-    walking the entire filesystem)."""
+    walking the entire filesystem). Uses os.walk(followlinks=False) so
+    symlinked directories are never recursed into, regardless of Python
+    version (Path.rglob on Python <3.12 may recurse into symlinked dirs).
+    Also verifies each yielded entry's resolved path stays within the
+    resolved target directory as a defense-in-depth measure."""
     try:
-        for entry in path.rglob("*"):
-            # Skip symlinks — never follow links outside the target tree
-            if entry.is_symlink():
-                continue
-            if skip_hidden and entry.name.startswith("."):
-                continue
-            yield entry
+        target_resolved = path.resolve()
+    except (OSError, RuntimeError):
+        return
+    try:
+        for root, dirs, files in os.walk(path, followlinks=False):
+            root_path = Path(root)
+            # Filter out hidden dirs in-place so os.walk doesn't descend into them
+            if skip_hidden:
+                dirs[:] = [d for d in dirs if not d.startswith(".")]
+            for name in files:
+                entry = root_path / name
+                # Skip symlinks — never follow links outside the target tree
+                if entry.is_symlink():
+                    continue
+                if skip_hidden and name.startswith("."):
+                    continue
+                # Defense-in-depth: verify resolved path is within target
+                try:
+                    if target_resolved not in entry.resolve().parents and \
+                       entry.resolve() != target_resolved:
+                        continue
+                except (OSError, RuntimeError):
+                    continue
+                yield entry
     except (OSError, PermissionError):
         return

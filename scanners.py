@@ -12,7 +12,6 @@ Modules match the original's Framework structure:
 """
 import os
 import glob
-import shutil
 import time
 import hashlib
 import struct
@@ -415,13 +414,21 @@ def scan_malware() -> ScanResult:
                 result.add(ScanItem(path="configuration-profile", size=0, category="Config Profile", detail=f"Profile: {line.strip()[:80]}"))
 
     # 5. EICAR test (if present) — verify content, not just filename
+    # SAFETY: EICAR files found in user data directories (~/Downloads,
+    # ~/Desktop, ~/Documents) are marked removable=False. These dirs are
+    # in PROTECTED_DESCENDANTS so clean_items() would refuse them anyway,
+    # but we also mark them non-removable so the UI doesn't offer them
+    # for deletion via the general clean flow. Malware removal should go
+    # through an explicit, separately-confirmed path.
     for d in ["~/Downloads", "~/Desktop", "~/Documents"]:
         p = expand(d)
         if p.exists():
             for f in p.glob("*eicar*test*"):
                 try:
                     if f.is_file() and EICAR in f.read_text(errors="ignore"):
-                        result.add(ScanItem(path=str(f), size=f.stat().st_size, category="Test Virus", detail="EICAR test file"))
+                        result.add(ScanItem(path=str(f), size=f.stat().st_size,
+                                    category="Test Virus", detail="EICAR test file",
+                                    removable=False))
                 except OSError:
                     pass
 
@@ -760,16 +767,50 @@ def shred_file(path: str, passes: int = 3) -> tuple[bool, str]:
 # ──────────────────────────────────────────────────────────────
 
 def scan_duplicates(target: str = "~", min_size_mb: float = 1) -> ScanResult:
-    """Find duplicate files by hash."""
+    """Find duplicate files by hash.
+    SAFETY: Excludes ~/Library, ~/Applications, and other non-user-data
+    directories from the scan. Files in ~/Library (Safari history,
+    application support, etc.) are NOT in PROTECTED_DESCENDANTS and would
+    otherwise be marked removable=True — excluding them at scan time
+    prevents critical user data from being offered for deletion."""
     result = ScanResult(module="Duplicate Finder")
     p = expand(target)
     if not p.exists():
         return result
+    # Directories to NEVER scan for duplicates — they contain system/app
+    # state, not user files. Deleting duplicates here would corrupt apps.
+    excluded_dirs = {
+        p / "Library",
+        p / "Applications",
+        p / ".Trash",
+        p / "Library" / "Containers",
+        p / "Library" / "Group Containers",
+    }
+    # Also resolve excluded dirs for robust matching
+    excluded_resolved = set()
+    for ex in excluded_dirs:
+        try:
+            excluded_resolved.add(ex.resolve())
+        except (OSError, RuntimeError):
+            pass
+
+    def _is_excluded(entry: Path) -> bool:
+        try:
+            r = entry.resolve()
+            for ex in excluded_resolved:
+                if r == ex or ex in r.parents:
+                    return True
+        except (OSError, RuntimeError):
+            return True  # treat unresolvable as excluded (safe default)
+        return False
+
     # Group by (size, first_4k_hash) then full hash
     size_groups: dict[int, list[Path]] = {}
     for f in dir_walk(p, skip_hidden=True):
         try:
             if not f.is_file() or f.is_symlink():
+                continue
+            if _is_excluded(f):
                 continue
             sz = f.stat().st_size
             if sz < min_size_mb * 1_000_000:
@@ -1006,35 +1047,58 @@ def _is_protected(path: Path) -> bool:
     return False
 
 
-def _delete_dir_contents(path: Path) -> int:
+def _delete_dir_contents(path: Path) -> tuple[int, list[str]]:
     """Delete the CONTENTS of a directory (files and subdirs inside it),
     but preserve the directory itself. This is the safe way to clean caches/logs.
-    Returns count of items removed."""
+    Returns (count of items removed, list of error messages).
+
+    SAFETY: Every child — symlink, file, or directory — is checked against
+    _is_protected() before removal. Subdirectories are recursed into via
+    _delete_dir_contents() (not shutil.rmtree) so nested symlinks are never
+    followed and nested protected paths are never deleted."""
     removed = 0
+    errors: list[str] = []
     try:
         for child in path.iterdir():
             # SAFETY: Always check is_symlink() FIRST and unlink it.
             # Never rmtree a symlink — rmtree follows the link and would
             # delete the target tree (e.g. a symlink to ~/Documents).
             if child.is_symlink():
+                # SAFETY: even symlinks must be protected-checked — never
+                # remove a symlink inside a protected directory.
+                if _is_protected(child):
+                    errors.append(f"Skipped (protected): {child}")
+                    continue
                 try:
                     child.unlink()
                     removed += 1
-                except (OSError, PermissionError):
-                    pass
+                except (OSError, PermissionError) as e:
+                    errors.append(f"Failed: {child} — {e}")
+                continue
+            # SAFETY: every deletion path checks _is_protected() first.
+            # No exceptions — the rule applies to unlink and rmtree alike.
+            if _is_protected(child):
+                errors.append(f"Skipped (protected): {child}")
                 continue
             try:
                 if child.is_file():
                     child.unlink()
                     removed += 1
                 elif child.is_dir():
-                    shutil.rmtree(child, ignore_errors=True)
-                    removed += 1
-            except (OSError, PermissionError):
-                pass
-    except (OSError, PermissionError):
-        pass
-    return removed
+                    # SAFETY: Recurse via _delete_dir_contents() instead of
+                    # shutil.rmtree(). rmtree(follow_symlinks=True by default)
+                    # would follow any nested symlink inside the child dir and
+                    # delete files outside the cache (e.g. a symlink pointing
+                    # to ~/Documents). Recursing re-runs the is_symlink() and
+                    # _is_protected() checks on every nested entry.
+                    sub_removed, sub_errors = _delete_dir_contents(child)
+                    removed += sub_removed
+                    errors.extend(sub_errors)
+            except (OSError, PermissionError) as e:
+                errors.append(f"Failed: {child} — {e}")
+    except (OSError, PermissionError) as e:
+        errors.append(f"Failed to iterate {path} — {e}")
+    return removed, errors
 
 
 def clean_items(items: list[ScanItem], progress_cb=None) -> tuple[int, int, list[str]]:
@@ -1074,8 +1138,12 @@ def clean_items(items: list[ScanItem], progress_cb=None) -> tuple[int, int, list
                 # Delete CONTENTS of the directory, not the directory itself.
                 # This is critical for cache/log dirs that macOS/apps expect
                 # to exist. The directory is preserved, contents are removed.
-                _delete_dir_contents(p)
-                deleted += 1
+                sub_removed, sub_errors = _delete_dir_contents(p)
+                deleted += 1 if sub_removed > 0 else 0
+                # Surface any errors encountered while clearing the directory.
+                for err in sub_errors:
+                    errors.append(err)
+                    failed += 1
         except (OSError, PermissionError) as e:
             failed += 1
             errors.append(f"Failed: {item.path} — {e}")
@@ -1128,7 +1196,17 @@ def uninstall_app(app_path: str, progress_cb=None) -> tuple[int, list[str]]:
             if p.is_symlink():
                 p.unlink()
             else:
-                shutil.rmtree(p, ignore_errors=True)
+                # SAFETY: Use _delete_dir_contents() + rmdir instead of
+                # shutil.rmtree(). rmtree follows nested symlinks on
+                # Python <3.12, which could delete files outside the app
+                # bundle if it contains a symlink to a user data dir.
+                # _delete_dir_contents checks is_symlink() and
+                # _is_protected() on every nested entry.
+                _delete_dir_contents(p)
+                try:
+                    p.rmdir()  # remove the now-empty directory shell
+                except OSError:
+                    pass  # non-empty or permission — contents were cleared
             deleted += 1
             msgs.append(f"Removed: {p.name}")
         except Exception as e:
@@ -1147,7 +1225,13 @@ def uninstall_app(app_path: str, progress_cb=None) -> tuple[int, list[str]]:
             elif lo.is_file():
                 lo.unlink()
             elif lo.is_dir():
-                shutil.rmtree(lo, ignore_errors=True)
+                # SAFETY: Use _delete_dir_contents() + rmdir instead of
+                # shutil.rmtree() to prevent following nested symlinks.
+                _delete_dir_contents(lo)
+                try:
+                    lo.rmdir()
+                except OSError:
+                    pass
             deleted += 1
             msgs.append(f"Removed leftover: {lo}")
         except Exception as e:

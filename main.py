@@ -558,6 +558,12 @@ class App(tk.Tk):
             # Read checkbox state from tree
             items_to_clean = []
             for item in result.items:
+                # SAFETY: Default to deselected. Only select if the tree
+                # row is found AND its checkbox is checked. Never carry
+                # over the original ScanResult.selected value — the user
+                # may have unchecked items in the UI. This matches the
+                # smart_scan path's behavior.
+                item.selected = False
                 # Find corresponding tree row
                 for child in self.tree.get_children():
                     vals = self.tree.item(child, "values")
