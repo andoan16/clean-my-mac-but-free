@@ -576,8 +576,10 @@ class App(tk.Tk):
                               hover_bg=BG3, hover_fg=FG2)
 
         def worker():
-            deleted, failed = clean_items(items_to_clean, progress_cb=lambda d, t: self.log(f"  {d}/{t}..."))
+            deleted, failed, errors = clean_items(items_to_clean, progress_cb=lambda d, t: self.log(f"  {d}/{t}..."))
             self.log(f"Cleanup complete: {deleted} removed, {failed} failed")
+            for err in errors:
+                self.log(f"  ⚠ {err}")
             # Re-scan to show updated state
             self.on_scan()
 

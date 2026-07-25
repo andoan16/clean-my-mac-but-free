@@ -47,9 +47,10 @@ def file_size(path: Path) -> int:
 def safe_remove(path: Path):
     """Delete file or dir, best-effort.
     SAFETY: Checks _is_protected() to refuse deleting protected paths.
-    Checks is_symlink() before rmtree to prevent following links."""
+    Checks is_symlink() before rmtree to prevent following links.
+    For cache/log directories, uses _delete_dir_contents() to preserve the dir."""
     # Import here to avoid circular import (scanners imports utils)
-    from scanners import _is_protected
+    from scanners import _is_protected, _delete_dir_contents
     if _is_protected(path):
         return
     try:
@@ -58,6 +59,21 @@ def safe_remove(path: Path):
         elif path.is_file():
             path.unlink()
         elif path.is_dir():
+            # SAFETY: Never rmtree cache/log directories — preserve the dir itself.
+            # These are dirs macOS/apps expect to exist. Delete contents only.
+            cache_log_paths = {
+                Path.home() / "Library" / "Caches",
+                Path.home() / "Library" / "Logs",
+                Path("/Library") / "Caches",
+                Path("/Library") / "Logs",
+            }
+            try:
+                resolved = path.resolve()
+                if any(resolved == p.resolve() for p in cache_log_paths):
+                    _delete_dir_contents(path)
+                    return
+            except (OSError, RuntimeError):
+                pass
             shutil.rmtree(path, ignore_errors=True)
     except (OSError, PermissionError):
         pass

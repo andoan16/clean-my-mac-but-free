@@ -66,7 +66,7 @@ SYSTEM_JUNK_PATHS = {
     "System Migration": ("/Library/SystemMigration/History", False),
     "Adobe Media Cache": ("~/Library/Application Support/Adobe/Common/Media Cache Files", True),
     "Spotify Cache": ("~/Library/Application Support/Spotify/PersistentCache/Storage", True),
-    "Photos Cache": ("~/Library/Containers/com.apple.Photos/Data/Library/Caches", True),
+    "Photos Cache": ("~/Library/Containers/com.apple.Photos/Data/Library/Caches", False),  # inside Containers — protected, info only
     "Xcode DerivedData": ("~/Library/Developer/Xcode/DerivedData", True),
     "Xcode Archives": ("~/Library/Developer/Xcode/Archives", False),  # user archives — info only
     "Xcode iOS Device Support": ("~/Library/Developer/Xcode/iOS DeviceSupport", True),
@@ -100,7 +100,7 @@ def scan_system_junk() -> ScanResult:
                 sz = dmg.stat().st_size
                 if sz > 0:
                     result.add(ScanItem(path=str(dmg), size=sz, category="Disk Image",
-                                        detail=f"Unused DMG: {dmg.name}"))
+                                        detail=f"Unused DMG: {dmg.name}", removable=False))
             except OSError:
                 pass
         for iso in downloads.glob("*.iso"):
@@ -108,7 +108,7 @@ def scan_system_junk() -> ScanResult:
                 sz = iso.stat().st_size
                 if sz > 0:
                     result.add(ScanItem(path=str(iso), size=sz, category="Disk Image",
-                                        detail=f"Unused ISO: {iso.name}"))
+                                        detail=f"Unused ISO: {iso.name}", removable=False))
             except OSError:
                 pass
     # Broken login items
@@ -235,7 +235,7 @@ def scan_unused_disk_images() -> ScanResult:
                         continue
                     sz = f.stat().st_size
                     if sz > 0:
-                        result.add(ScanItem(path=str(f), size=sz, category="Disk Image", detail=f"{f.name} ({human_size(sz)})"))
+                        result.add(ScanItem(path=str(f), size=sz, category="Disk Image", detail=f"{f.name} ({human_size(sz)})", removable=False))
                 except OSError:
                     pass
     return result
@@ -265,17 +265,33 @@ def scan_privacy() -> ScanResult:
     """Scan for privacy traces: browser data + recent items."""
     result = ScanResult(module="Privacy")
     for name, pattern in PRIVACY_PATHS.items():
-        expanded = expand(pattern)
-        # Handle glob patterns
-        matches = [expanded] if expanded.exists() else []
+        # Handle glob patterns — expand() calls .resolve() which treats * as
+        # a literal character, so we split at the first * segment and glob
+        # from the parent that exists.
         if "*" in pattern:
-            parent = expanded.parent
-            if parent.exists():
-                matches = list(parent.glob(expanded.name))
-        for m in matches:
-            if m.exists():
-                sz = file_size(m)
-                result.add(ScanItem(path=str(m), size=sz, category=name, detail=name))
+            # Split pattern into the non-glob prefix and the glob suffix
+            parts = pattern.split("*", 1)
+            prefix = parts[0]  # e.g. ~/Library/Application Support/Firefox/Profiles/
+            suffix = "*" + parts[1]  # e.g. */places.sqlite
+            # Expand the prefix (everything before the first *)
+            prefix_path = expand(prefix.rstrip("/"))
+            if prefix_path.exists() and prefix_path.is_dir():
+                # Glob the remaining pattern from the prefix parent
+                # Use the original pattern relative to the prefix
+                glob_pattern = Path(suffix).as_posix()
+                # Walk: glob from prefix_path using the suffix pattern
+                # suffix starts with * — glob the full remaining path
+                remaining = suffix.lstrip("/")
+                for m in prefix_path.glob(remaining):
+                    if m.exists():
+                        sz = file_size(m)
+                        result.add(ScanItem(path=str(m), size=sz, category=name, detail=name))
+            continue
+        # Non-glob pattern — direct match
+        expanded = expand(pattern)
+        if expanded.exists():
+            sz = file_size(expanded)
+            result.add(ScanItem(path=str(expanded), size=sz, category=name, detail=name))
     # Recent items lists
     recent_paths = [
         ("Recent Apps", "~/Library/Application Support/com.apple.sharedfilelist/com.apple.LSSharedFileList.RecentApplications"),
@@ -516,7 +532,27 @@ def scan_installed_apps() -> ScanResult:
                             version = pl.get("CFBundleShortVersionString", "")
                     except Exception:
                         pass
-                result.add(ScanItem(path=str(app), size=sz, category="Application", detail=f"{app.name} v{version} ({human_size(sz)})"))
+                # SAFETY: Mark Apple system apps as non-removable.
+                # /System/Applications apps are also blocked by _is_protected()
+                # (PROTECTED_DESCENDANTS), but removable=False prevents them from
+                # even appearing as deletable in the UI.
+                is_apple_app = False
+                if info_plist.exists():
+                    try:
+                        with open(info_plist, "rb") as f:
+                            pl = plistlib.load(f)
+                            version = pl.get("CFBundleShortVersionString", "")
+                            bid = pl.get("CFBundleIdentifier", "")
+                            if bid.startswith("com.apple."):
+                                is_apple_app = True
+                    except Exception:
+                        pass
+                # Apps in /System/Applications are always Apple apps
+                if ad == Path("/System/Applications"):
+                    is_apple_app = True
+                result.add(ScanItem(path=str(app), size=sz, category="Application",
+                                    detail=f"{app.name} v{version} ({human_size(sz)})",
+                                    removable=not is_apple_app))
             except OSError:
                 pass
     return result
@@ -664,7 +700,7 @@ def scan_large_old_files(min_size_mb: int = 100, min_age_days: int = 90) -> Scan
                     # user must explicitly choose which to delete.
                     result.add(ScanItem(path=str(f), size=sz, category="Large & Old",
                                 detail=f"{f.name} ({human_size(sz)}, {age}d old)",
-                                selected=False))
+                                selected=False, removable=False))
             except OSError:
                 pass
     return result
@@ -754,8 +790,8 @@ def scan_duplicates(target: str = "~", min_size_mb: float = 1) -> ScanResult:
             if len(dupes) >= 2:
                 # Keep first, mark rest as duplicates
                 for i, d in enumerate(dupes):
-                    removable = i > 0
-                    result.add(ScanItem(path=str(d), size=sz, category="Duplicate", detail=f"Dup group {h[:8]} ({d.name})", selected=removable))
+                    removable = i > 0 and not _is_protected(d)
+                    result.add(ScanItem(path=str(d), size=sz, category="Duplicate", detail=f"Dup group {h[:8]} ({d.name})", selected=removable, removable=removable))
     return result
 
 # ──────────────────────────────────────────────────────────────
@@ -812,7 +848,7 @@ def scan_similar_images(target: str = "~") -> ScanResult:
                     result.add(ScanItem(path=str(img), size=img.stat().st_size,
                                 category="Similar Image",
                                 detail=f"{img.name} ({dim[0]}x{dim[1]})",
-                                selected=False))
+                                selected=False, removable=False))
     return result
 
 # ──────────────────────────────────────────────────────────────
@@ -904,13 +940,14 @@ PROTECTED_EXACT = {
     Path("/Library"),                  # /Library itself — but /Library/Caches cleanable
     Path("/System"),
     Path("/Applications"),             # /Applications itself — individual .app ok
-    Path("/System/Applications"),      # never uninstall system apps
     Path("/usr"),
     Path("/bin"),
     Path("/sbin"),
 }
 
 PROTECTED_DESCENDANTS = {
+    # System apps — protect the dir AND all children (never delete Apple apps)
+    Path("/System/Applications"),
     # User data directories — protect the dir AND all children
     Path.home() / "Downloads",
     Path.home() / "Documents",
@@ -930,6 +967,8 @@ PROTECTED_DESCENDANTS = {
     # NOTE: /Library/Caches and /Library/Logs likewise NOT protected — contents
     # cleaned via _delete_dir_contents(); /Library is in PROTECTED_EXACT so the
     # dir itself cannot be rmtree'd.
+    # NOTE: /System/Applications is in PROTECTED_DESCENDANTS (not PROTECTED_EXACT)
+    # so that all .app bundles inside it are protected from deletion.
 }
 
 # Backward-compat alias: union of both sets (some callers iterate PROTECTED_PATHS)
@@ -998,8 +1037,8 @@ def _delete_dir_contents(path: Path) -> int:
     return removed
 
 
-def clean_items(items: list[ScanItem], progress_cb=None) -> tuple[int, int]:
-    """Delete selected items. Returns (deleted_count, failed_count).
+def clean_items(items: list[ScanItem], progress_cb=None) -> tuple[int, int, list[str]]:
+    """Delete selected items. Returns (deleted_count, failed_count, error_messages).
 
     SAFETY RULES:
     1. Never delete a protected path (home, Downloads, Documents, Library, etc.)
@@ -1009,6 +1048,7 @@ def clean_items(items: list[ScanItem], progress_cb=None) -> tuple[int, int]:
     """
     deleted = 0
     failed = 0
+    errors: list[str] = []
     # Virtual paths that are display-only (no real file to delete)
     virtual_paths = {"login-item", "brew-cask", "brew-outdated",
                      "mas-outdated", "configuration-profile", "background-process"}
@@ -1025,6 +1065,7 @@ def clean_items(items: list[ScanItem], progress_cb=None) -> tuple[int, int]:
             # SAFETY CHECK: never delete protected paths
             if _is_protected(p):
                 failed += 1
+                errors.append(f"Skipped (protected): {p}")
                 continue
             if p.is_symlink() or p.is_file():
                 p.unlink()
@@ -1035,11 +1076,12 @@ def clean_items(items: list[ScanItem], progress_cb=None) -> tuple[int, int]:
                 # to exist. The directory is preserved, contents are removed.
                 _delete_dir_contents(p)
                 deleted += 1
-        except (OSError, PermissionError):
+        except (OSError, PermissionError) as e:
             failed += 1
+            errors.append(f"Failed: {item.path} — {e}")
         if progress_cb:
             progress_cb(i + 1, len(items))
-    return deleted, failed
+    return deleted, failed, errors
 
 def uninstall_app(app_path: str, progress_cb=None) -> tuple[int, list[str]]:
     """Uninstall app + leftovers. Returns (deleted_count, messages).
@@ -1051,7 +1093,7 @@ def uninstall_app(app_path: str, progress_cb=None) -> tuple[int, list[str]]:
     msgs = []
     deleted = 0
     # SAFETY: never delete a top-level directory (e.g. /Applications itself)
-    if p.parent == Path("/") or p.parent == Path("/Applications") and p == Path("/Applications"):
+    if p.parent == Path("/") or (p.parent == Path("/Applications") and p == Path("/Applications")):
         return 0, ["Refused: will not delete a top-level directory"]
     # SAFETY: refuse Apple system apps by checking bundle ID
     info_plist = p / "Contents" / "Info.plist"
@@ -1065,10 +1107,11 @@ def uninstall_app(app_path: str, progress_cb=None) -> tuple[int, list[str]]:
         except Exception:
             pass
     # SAFETY: still check _is_protected — this protects /System, /usr, etc.
-    # and prevents deleting the /Applications or /System/Applications dirs
-    # themselves. Individual .app bundles under /Applications are allowed.
-    if _is_protected(p) and not (p.is_dir() and p.suffix == ".app" and
-                                  p.parent in (Path("/Applications"), Path("/System/Applications"))):
+    # and prevents deleting the /Applications dir itself.
+    # /System/Applications is in PROTECTED_DESCENDANTS, so all .app bundles
+    # inside it are protected. Individual .app bundles under /Applications
+    # are allowed (not in PROTECTED_DESCENDANTS).
+    if _is_protected(p):
         return 0, [f"Refused: {p} is in a protected directory (system app?)"]
     # SAFETY: never uninstall from /System/Applications
     try:
