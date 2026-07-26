@@ -717,20 +717,55 @@ class App(tk.Tk):
             self.log(f"Refused: {p} is protected")
             return
         trash = Path.home() / ".Trash"
+        # SAFETY helper for name-collision-safe destination selection.
+        def _trash_dest(name: str) -> Path:
+            d = trash / name
+            if d.exists():
+                d = trash / f"{name}_{datetime.now().strftime('%H%M%S')}"
+            return d
         try:
             if p.is_dir() and not p.is_symlink():
-                # Move entire dir to trash
-                dest = trash / p.name
-                # Handle name collision
-                if dest.exists():
-                    dest = trash / f"{p.name}_{datetime.now().strftime('%H%M%S')}"
-                shutil.move(str(p), str(dest))
+                # Move entire dir to trash.
+                # SAFETY: Do NOT use shutil.move() for directories — on a
+                # cross-filesystem move it internally falls back to
+                # shutil.copytree(symlinks=True) + shutil.rmtree(src). On
+                # Python <3.12, rmtree FOLLOWS symlinks inside the source
+                # directory and would delete the target's contents (e.g. a
+                # symlink inside the dir pointing to ~/Documents). That
+                # bypasses every _delete_dir_contents() safety check the
+                # project established to prevent exactly this. Instead:
+                #   1. Try os.rename for a same-filesystem atomic move.
+                #   2. On cross-filesystem (OSError EXDEV/ENODEV), copy the
+                #      tree preserving symlinks (symlinks=True so the link
+                #      itself is copied, not its target), then remove the
+                #      source via _delete_dir_contents() + rmdir() which
+                #      checks is_symlink() and _is_protected() on every
+                #      nested entry — never following a symlink.
+                dest = _trash_dest(p.name)
+                try:
+                    os.rename(str(p), str(dest))
+                except OSError:
+                    # Cross-filesystem (EXDEV) or other rename failure —
+                    # copy then safe-remove source.
+                    from scanners import _delete_dir_contents
+                    shutil.copytree(str(p), str(dest), symlinks=True)
+                    removed, errors = _delete_dir_contents(p)
+                    try:
+                        p.rmdir()  # remove now-empty source dir shell
+                    except OSError:
+                        pass
+                    if errors:
+                        self.log(f"  ⚠ {len(errors)} errors clearing source: {errors[0]}")
             else:
-                # File or symlink
-                dest = trash / p.name
-                if dest.exists():
-                    dest = trash / f"{p.name}_{datetime.now().strftime('%H%M%S')}"
-                shutil.move(str(p), str(dest))
+                # File (symlinks already refused above).
+                dest = _trash_dest(p.name)
+                # os.rename is atomic on same filesystem; shutil.move handles
+                # cross-filesystem for single files without rmtree, so it is
+                # safe here (rmtree only happens for directory moves).
+                try:
+                    os.rename(str(p), str(dest))
+                except OSError:
+                    shutil.move(str(p), str(dest))
             self.log(f"Moved to Trash: {p.name}")
             # Re-scan to update results
             self.on_scan()
