@@ -13,6 +13,7 @@ Modules match the original's Framework structure:
 import os
 import glob
 import time
+import json
 import hashlib
 import struct
 import plistlib
@@ -22,6 +23,60 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 from utils import expand, file_size, human_size, safe_remove, file_hash, run_shell, run_sudo, file_age_days, dir_walk
+
+# ──────────────────────────────────────────────────────────────
+#  Exclusion list — paths user has chosen to skip from scans
+# ──────────────────────────────────────────────────────────────
+
+EXCLUSIONS_FILE = Path.home() / ".cleanmymac-free-exclusions.json"
+
+def load_exclusions() -> list[str]:
+    """Load exclusion list from JSON config file."""
+    try:
+        if EXCLUSIONS_FILE.exists():
+            with open(EXCLUSIONS_FILE) as f:
+                data = json.load(f)
+                return data.get("exclusions", [])
+    except (OSError, json.JSONDecodeError):
+        pass
+    return []
+
+def save_exclusions(exclusions: list[str]):
+    """Save exclusion list to JSON config file."""
+    try:
+        with open(EXCLUSIONS_FILE, "w") as f:
+            json.dump({"exclusions": exclusions}, f, indent=2)
+    except OSError:
+        pass
+
+def add_exclusion(path: str):
+    """Add a path to the exclusion list."""
+    exclusions = load_exclusions()
+    if path not in exclusions:
+        exclusions.append(path)
+        save_exclusions(exclusions)
+
+def remove_exclusion(path: str):
+    """Remove a path from the exclusion list."""
+    exclusions = load_exclusions()
+    if path in exclusions:
+        exclusions.remove(path)
+        save_exclusions(exclusions)
+
+def _is_excluded(path: Path) -> bool:
+    """Check if a path matches any exclusion pattern."""
+    exclusions = load_exclusions()
+    if not exclusions:
+        return False
+    try:
+        resolved = str(path.resolve())
+    except (OSError, RuntimeError):
+        return False
+    for ex in exclusions:
+        ex_expanded = str(Path(os.path.expandvars(os.path.expanduser(ex))).resolve())
+        if resolved == ex_expanded or ex_expanded in resolved:
+            return True
+    return False
 
 # ──────────────────────────────────────────────────────────────
 #  Data models
@@ -73,12 +128,16 @@ SYSTEM_JUNK_PATHS = {
     "Xcode Device Logs": ("~/Library/Developer/Xcode/iOS Device Logs", True),
 }
 
-def scan_system_junk() -> ScanResult:
+def scan_system_junk(cancel_check=None) -> ScanResult:
     """Scan all system junk cache/log locations."""
     result = ScanResult(module="System Junk")
     for category, (path_str, removable) in SYSTEM_JUNK_PATHS.items():
+        if cancel_check and cancel_check():
+            return result
         p = expand(path_str)
         if not p.exists():
+            continue
+        if _is_excluded(p):
             continue
         if p.is_file():
             sz = file_size(p)
@@ -95,6 +154,8 @@ def scan_system_junk() -> ScanResult:
     downloads = expand("~/Downloads")
     if downloads.exists():
         for dmg in downloads.glob("*.dmg"):
+            if cancel_check and cancel_check():
+                return result
             try:
                 sz = dmg.stat().st_size
                 if sz > 0:
@@ -515,7 +576,7 @@ def run_maintenance_task(task: str) -> tuple[bool, str]:
 #  Full app removal including leftovers: caches, prefs, logs, containers
 # ──────────────────────────────────────────────────────────────
 
-def scan_installed_apps() -> ScanResult:
+def scan_installed_apps(cancel_check=None) -> ScanResult:
     """List all installed applications."""
     result = ScanResult(module="Installed Apps")
     app_dirs = [Path("/Applications"), Path("/System/Applications"), expand("~/Applications")]
@@ -524,6 +585,8 @@ def scan_installed_apps() -> ScanResult:
         if not ad.exists():
             continue
         for app in ad.glob("*.app"):
+            if cancel_check and cancel_check():
+                return result
             if app.name in seen:
                 continue
             seen.add(app.name)
@@ -658,7 +721,7 @@ def scan_app_updates() -> ScanResult:
 #  Drive visualizer - biggest folders/files
 # ──────────────────────────────────────────────────────────────
 
-def scan_space_lens(target: str = "~", depth: int = 2) -> ScanResult:
+def scan_space_lens(target: str = "~", depth: int = 2, cancel_check=None) -> ScanResult:
     """Scan directory and return biggest items."""
     result = ScanResult(module="Space Lens")
     p = expand(target)
@@ -667,7 +730,11 @@ def scan_space_lens(target: str = "~", depth: int = 2) -> ScanResult:
     entries = []
     try:
         for entry in p.iterdir():
+            if cancel_check and cancel_check():
+                return result
             if entry.name.startswith(".") and entry.name not in [".Trash"]:
+                continue
+            if _is_excluded(entry):
                 continue
             sz = file_size(entry)
             if sz > 1024:
@@ -686,17 +753,23 @@ def scan_space_lens(target: str = "~", depth: int = 2) -> ScanResult:
 #  12. Large & Old Files  (LAOFScanning.framework)
 # ──────────────────────────────────────────────────────────────
 
-def scan_large_old_files(min_size_mb: int = 100, min_age_days: int = 90) -> ScanResult:
+def scan_large_old_files(min_size_mb: int = 100, min_age_days: int = 90, cancel_check=None) -> ScanResult:
     """Find large files not accessed in a while."""
     result = ScanResult(module="Large & Old Files")
     search_dirs = ["~/Documents", "~/Downloads", "~/Desktop", "~/Movies", "~/Music"]
     for sd in search_dirs:
+        if cancel_check and cancel_check():
+            return result
         p = expand(sd)
         if not p.exists():
             continue
         for f in dir_walk(p, skip_hidden=True):
+            if cancel_check and cancel_check():
+                return result
             try:
                 if not f.is_file() or f.is_symlink():
+                    continue
+                if _is_excluded(f):
                     continue
                 sz = f.stat().st_size
                 if sz < min_size_mb * 1_000_000:
@@ -724,6 +797,13 @@ def shred_file(path: str, passes: int = 3) -> tuple[bool, str]:
     p = Path(path)
     if not p.exists() or not p.is_file():
         return False, f"File not found: {path}"
+    # SAFETY: never shred a symlink. p.exists()/is_file() follow symlinks,
+    # so a symlink pointing at a regular file would pass the checks above.
+    # open(p, "r+b") would then overwrite the TARGET's content with random
+    # data, but p.unlink() would only remove the symlink — leaving the
+    # target on disk with destroyed content. Refuse up front.
+    if p.is_symlink():
+        return False, f"Refused: {path} is a symlink — shred the target file directly"
     # SAFETY: never shred protected paths
     if _is_protected(p):
         return False, f"Refused: {path} is in a protected directory"
@@ -766,7 +846,7 @@ def shred_file(path: str, passes: int = 3) -> tuple[bool, str]:
 #  14. Duplicate Finder  (OrganizeScanning - Duplicates)
 # ──────────────────────────────────────────────────────────────
 
-def scan_duplicates(target: str = "~", min_size_mb: float = 1) -> ScanResult:
+def scan_duplicates(target: str = "~", min_size_mb: float = 1, cancel_check=None) -> ScanResult:
     """Find duplicate files by hash.
     SAFETY: Excludes ~/Library, ~/Applications, and other non-user-data
     directories from the scan. Files in ~/Library (Safari history,
@@ -807,6 +887,8 @@ def scan_duplicates(target: str = "~", min_size_mb: float = 1) -> ScanResult:
     # Group by (size, first_4k_hash) then full hash
     size_groups: dict[int, list[Path]] = {}
     for f in dir_walk(p, skip_hidden=True):
+        if cancel_check and cancel_check():
+            return result
         try:
             if not f.is_file() or f.is_symlink():
                 continue
@@ -820,6 +902,8 @@ def scan_duplicates(target: str = "~", min_size_mb: float = 1) -> ScanResult:
             pass
     # For each size group with >1 file, hash and find dupes
     for sz, files in size_groups.items():
+        if cancel_check and cancel_check():
+            return result
         if len(files) < 2:
             continue
         hash_groups: dict[str, list[Path]] = {}
@@ -840,7 +924,7 @@ def scan_duplicates(target: str = "~", min_size_mb: float = 1) -> ScanResult:
 #  Group by image dimensions + file size proximity
 # ──────────────────────────────────────────────────────────────
 
-def scan_similar_images(target: str = "~") -> ScanResult:
+def scan_similar_images(target: str = "~", cancel_check=None) -> ScanResult:
     """Find visually similar images (same dimensions, similar size)."""
     result = ScanResult(module="Similar Images")
     p = expand(target)
@@ -850,6 +934,8 @@ def scan_similar_images(target: str = "~") -> ScanResult:
     image_exts = {".jpg", ".jpeg", ".png", ".heic", ".tiff", ".bmp", ".gif", ".webp"}
     images: list[Path] = []
     for f in dir_walk(p, skip_hidden=True):
+        if cancel_check and cancel_check():
+            return result
         try:
             if f.is_file() and f.suffix.lower() in image_exts:
                 images.append(f)
@@ -947,14 +1033,24 @@ def scan_extensions() -> ScanResult:
 #  Runs: System Junk + Mail + Trash + Malware + Login Items + Updates
 # ──────────────────────────────────────────────────────────────
 
-def smart_scan() -> dict[str, ScanResult]:
+def smart_scan(cancel_check=None) -> dict[str, ScanResult]:
     """Run the Smart Care scan combining core modules."""
     results = {}
-    results["System Junk"] = scan_system_junk()
+    results["System Junk"] = scan_system_junk(cancel_check)
+    if cancel_check and cancel_check():
+        return results
     results["Mail Attachments"] = scan_mail_attachments()
+    if cancel_check and cancel_check():
+        return results
     results["Trash Bins"] = scan_trash_bins()
+    if cancel_check and cancel_check():
+        return results
     results["Malware"] = scan_malware()
+    if cancel_check and cancel_check():
+        return results
     results["Login Items"] = scan_login_items()
+    if cancel_check and cancel_check():
+        return results
     results["App Updates"] = scan_app_updates()
     return results
 
