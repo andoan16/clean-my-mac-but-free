@@ -322,8 +322,25 @@ PRIVACY_PATHS = {
 }
 
 def scan_privacy() -> ScanResult:
-    """Scan for privacy traces: browser data + recent items."""
+    """Scan for privacy traces: browser data + recent items.
+    SAFETY: Checks if Safari/Chrome/Firefox are running before marking their
+    database files as removable. Deleting a browser's SQLite database while
+    the browser is running can corrupt the browser's state (same principle as
+    the Mail VACUUM running check). Running-browser items are marked
+    removable=False with a warning detail so the user is informed."""
     result = ScanResult(module="Privacy")
+    # Check which browsers are running — deleting their DBs while open can corrupt state
+    running_browsers = set()
+    for browser in ["Safari", "Google Chrome", "firefox"]:
+        code, out = run_shell(["pgrep", "-x", browser])
+        if code == 0 and out.strip():
+            running_browsers.add(browser)
+    # Map privacy path keywords to browser process names
+    browser_keywords = {
+        "Safari": "Safari",
+        "Chrome": "Google Chrome",
+        "Firefox": "firefox",
+    }
     for name, pattern in PRIVACY_PATHS.items():
         # Handle glob patterns — expand() calls .resolve() which treats * as
         # a literal character, so we split at the first * segment and glob
@@ -345,13 +362,28 @@ def scan_privacy() -> ScanResult:
                 for m in prefix_path.glob(remaining):
                     if m.exists():
                         sz = file_size(m)
-                        result.add(ScanItem(path=str(m), size=sz, category=name, detail=name))
+                        # SAFETY: if the browser is running, mark non-removable
+                        # to prevent corrupting its SQLite database.
+                        browser_proc = next((bp for kw, bp in browser_keywords.items() if kw in name), None)
+                        if browser_proc and browser_proc in running_browsers:
+                            result.add(ScanItem(path=str(m), size=sz, category=name,
+                                        detail=f"{name} (⚠ {browser_proc} is running — quit before cleaning)",
+                                        removable=False))
+                        else:
+                            result.add(ScanItem(path=str(m), size=sz, category=name, detail=name))
             continue
         # Non-glob pattern — direct match
         expanded = expand(pattern)
         if expanded.exists():
             sz = file_size(expanded)
-            result.add(ScanItem(path=str(expanded), size=sz, category=name, detail=name))
+            # SAFETY: if the browser is running, mark non-removable
+            browser_proc = next((bp for kw, bp in browser_keywords.items() if kw in name), None)
+            if browser_proc and browser_proc in running_browsers:
+                result.add(ScanItem(path=str(expanded), size=sz, category=name,
+                            detail=f"{name} (⚠ {browser_proc} is running — quit before cleaning)",
+                            removable=False))
+            else:
+                result.add(ScanItem(path=str(expanded), size=sz, category=name, detail=name))
     # Recent items lists
     recent_paths = [
         ("Recent Apps", "~/Library/Application Support/com.apple.sharedfilelist/com.apple.LSSharedFileList.RecentApplications"),
@@ -433,11 +465,19 @@ def scan_malware() -> ScanResult:
                     break
 
     # 2. Known adware file paths
+    # SAFETY: Adware .app bundles are marked removable=False so they are
+    # info-only in the UI. Removing an adware app should go through the
+    # Uninstaller (uninstall_app()) which properly cleans leftovers and
+    # checks bundle IDs — not through clean_items() which would delete
+    # the .app without cleaning its Library support files.
     for ap in KNOWN_ADWARE_PATHS:
         p = expand(ap)
         if p.exists():
             sz = file_size(p)
-            result.add(ScanItem(path=str(p), size=sz, category="Adware", detail=f"Known adware path: {p.name}"))
+            is_app = p.suffix == ".app"
+            result.add(ScanItem(path=str(p), size=sz, category="Adware",
+                                detail=f"Known adware path: {p.name}",
+                                removable=not is_app))  # .app → info-only; non-app → removable
 
     # 3. Suspicious browser extensions (Chrome/Safari)
     chrome_ext = expand("~/Library/Application Support/Google/Chrome/Default/Extensions")
@@ -592,20 +632,9 @@ def scan_installed_apps(cancel_check=None) -> ScanResult:
             seen.add(app.name)
             try:
                 sz = file_size(app)
-                # Get version
+                # Read Info.plist once — extract version and bundle ID together
                 info_plist = app / "Contents" / "Info.plist"
                 version = ""
-                if info_plist.exists():
-                    try:
-                        with open(info_plist, "rb") as f:
-                            pl = plistlib.load(f)
-                            version = pl.get("CFBundleShortVersionString", "")
-                    except Exception:
-                        pass
-                # SAFETY: Mark Apple system apps as non-removable.
-                # /System/Applications apps are also blocked by _is_protected()
-                # (PROTECTED_DESCENDANTS), but removable=False prevents them from
-                # even appearing as deletable in the UI.
                 is_apple_app = False
                 if info_plist.exists():
                     try:
@@ -617,6 +646,10 @@ def scan_installed_apps(cancel_check=None) -> ScanResult:
                                 is_apple_app = True
                     except Exception:
                         pass
+                # SAFETY: Mark Apple system apps as non-removable.
+                # /System/Applications apps are also blocked by _is_protected()
+                # (PROTECTED_DESCENDANTS), but removable=False prevents them from
+                # even appearing as deletable in the UI.
                 # Apps in /System/Applications are always Apple apps
                 if ad == Path("/System/Applications"):
                     is_apple_app = True
